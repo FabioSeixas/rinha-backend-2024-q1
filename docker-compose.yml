@@ -6,6 +6,8 @@ services:
     ports:
       - "5432:5432"
     command: postgres
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     environment:
       - POSTGRES_DB=rinha
       - POSTGRES_USER=admin
