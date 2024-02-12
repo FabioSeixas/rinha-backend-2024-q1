@@ -9,11 +9,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{
-    postgres::{PgPoolOptions, PgRow},
+    postgres::{ PgPoolOptions, PgRow},
     Postgres, Row,
 };
 
-use types::{CreateTransactionPayload, TransactionType};
+use types::{CreateTransactionPayload, Transaction, TransactionType};
 
 mod types;
 
@@ -47,6 +47,31 @@ impl Saldo {
     }
 }
 
+async fn client_exist(
+    db: &sqlx::pool::Pool<Postgres>,
+    client_id: &str,
+) -> Result<Cliente, sqlx::Error> {
+    sqlx::query("SELECT * from clientes WHERE id = $1")
+        .bind(client_id.parse::<i32>().unwrap())
+        .map(|row: PgRow| Cliente::new(row.get(0), row.get(1), row.get(2)))
+        .fetch_one(db)
+        .await
+}
+
+async fn get_current_saldo(
+    trx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    client_id: &str,
+) -> Result<i32, sqlx::Error> {
+    sqlx::query(
+        "SELECT valor FROM saldos 
+         WHERE cliente_id = $1",
+    )
+    .bind(client_id.parse::<i32>().unwrap())
+    .map(|row: PgRow| row.get(0))
+    .fetch_one(&mut **trx)
+    .await
+}
+
 #[debug_handler]
 async fn get_clientes(State(state): State<sqlx::pool::Pool<Postgres>>) -> impl IntoResponse {
     let clientes = sqlx::query("SELECT * from clientes")
@@ -59,14 +84,55 @@ async fn get_clientes(State(state): State<sqlx::pool::Pool<Postgres>>) -> impl I
 }
 
 #[debug_handler]
-async fn get_saldos(State(state): State<sqlx::pool::Pool<Postgres>>) -> impl IntoResponse {
-    let saldos = sqlx::query("SELECT * from saldos")
-        .map(|row: PgRow| Saldo::new(row.get(0), row.get(1), row.get(2)))
-        .fetch_all(&state)
-        .await
-        .expect("Error getting clients");
+async fn extrato(
+    State(state): State<sqlx::pool::Pool<Postgres>>,
+    Path(cliente_id): Path<String>,
+) -> impl IntoResponse {
+    match client_exist(&state, &cliente_id).await {
+        Ok(cliente) => {
+            let mut trx = state.begin().await.unwrap();
+            let saldo_atual = get_current_saldo(&mut trx, &cliente_id)
+                .await
+                .expect("Error while getting current saldo");
 
-    Json(serde_json::to_value(&saldos).unwrap())
+            let last_transactions: Vec<Transaction> = sqlx::query(
+                "SELECT valor, tipo, descricao, realizada_em::TEXT
+                 FROM transacoes
+                 WHERE cliente_id = $1
+                 LIMIT 10",
+            )
+            .bind(cliente_id.parse::<i32>().unwrap())
+            .map(|row: PgRow| Transaction::new(row.get(0), row.get(1), row.get(2), row.get(3)))
+            .fetch_all(&mut *trx)
+            .await
+            .expect("error while getting transactions");
+
+            trx.commit().await.unwrap();
+
+            let date = std::time::SystemTime::now();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "saldo": {
+                        "total": saldo_atual,
+                        "data_extrato": date,
+                        "limite": cliente.limite
+                    },
+                    "ultimas_transacoes": last_transactions
+
+                })),
+            )
+        }
+        Err(_) => {
+            println!("ERROR!");
+            (
+                StatusCode::from_u16(404).unwrap(),
+                Json(json!({
+                    "message":"cliente inexistente"
+                })),
+            )
+        }
+    }
 }
 
 #[debug_handler]
@@ -77,26 +143,15 @@ async fn transaction(
 ) -> impl IntoResponse {
     println!("{:?}", payload);
     println!("{:?}", client_id);
-    match sqlx::query("SELECT * from clientes WHERE id = $1")
-        .bind(client_id.parse::<i32>().unwrap())
-        .map(|row: PgRow| Cliente::new(row.get(0), row.get(1), row.get(2)))
-        .fetch_one(&state)
-        .await
-    {
+    match client_exist(&state, &client_id).await {
         Ok(cliente) => {
             println!("OK!");
 
             let mut trx = state.begin().await.unwrap();
 
-            let saldo_atual: i32 = sqlx::query(
-                "SELECT valor FROM saldos 
-                 WHERE cliente_id = $1",
-            )
-            .bind(client_id.parse::<i32>().unwrap())
-            .map(|row: PgRow| row.get(0))
-            .fetch_one(&mut *trx)
-            .await
-            .expect("Error while getting current saldo");
+            let saldo_atual = get_current_saldo(&mut trx, &client_id)
+                .await
+                .expect("Error while getting current saldo");
 
             println!("saldo atual: {saldo_atual}");
 
@@ -198,7 +253,7 @@ async fn main() -> Result<(), sqlx::Error> {
 
     let app = Router::new()
         .route("/clientes", get(get_clientes))
-        .route("/saldos", get(get_saldos))
+        .route("/clientes/:id/extrato", get(extrato))
         .route("/clientes/:id/transacoes", post(transaction))
         .with_state(pool.clone());
 
