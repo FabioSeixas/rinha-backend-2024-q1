@@ -13,7 +13,7 @@ use sqlx::{
     Postgres, Row,
 };
 
-use types::CreateTransactionPayload;
+use types::{CreateTransactionPayload, TransactionType};
 
 mod types;
 
@@ -85,28 +85,100 @@ async fn transaction(
     {
         Ok(cliente) => {
             println!("OK!");
+
+            let mut trx = state.begin().await.unwrap();
+
+            let saldo_atual: i32 = sqlx::query(
+                "SELECT valor FROM saldos 
+                 WHERE cliente_id = $1",
+            )
+            .bind(client_id.parse::<i32>().unwrap())
+            .map(|row: PgRow| row.get(0))
+            .fetch_one(&mut *trx)
+            .await
+            .expect("Error while getting current saldo");
+
+            println!("saldo atual: {saldo_atual}");
+
+            let transaction_type = if payload.tipo == "d" {
+                TransactionType::Debit
+            } else {
+                TransactionType::Credit
+            };
+
+            let new_saldo = match transaction_type {
+                types::TransactionType::Debit => {
+                    let new_saldo = saldo_atual - payload.valor;
+                    println!("new saldo: {new_saldo}");
+                    if new_saldo < 0 {
+                        if new_saldo.abs() > cliente.limite {
+                            return (
+                                StatusCode::from_u16(422).unwrap(),
+                                Json(json!({
+                                    "message":"sem limite disponivel"
+                                })),
+                            );
+                        }
+                    }
+
+                    sqlx::query(
+                        "UPDATE saldos 
+                         SET valor = valor - $1
+                         WHERE cliente_id = $2",
+                    )
+                    .bind(payload.valor)
+                    .bind(client_id.parse::<i32>().unwrap())
+                    .execute(&mut *trx)
+                    .await
+                    .expect("error while updating saldo");
+                    new_saldo
+                }
+                types::TransactionType::Credit => {
+                    let new_saldo = sqlx::query(
+                        "UPDATE saldos 
+                         SET valor = valor + $1
+                         WHERE cliente_id = $2
+                         RETURNING valor",
+                    )
+                    .bind(payload.valor)
+                    .bind(client_id.parse::<i32>().unwrap())
+                    .map(|row: PgRow| row.get(0))
+                    .fetch_one(&mut *trx)
+                    .await
+                    .expect("error while updating saldo");
+                    new_saldo
+                }
+            };
+
             sqlx::query(
                 "INSERT INTO transacoes 
                  (cliente_id, valor, tipo, descricao)
                  VALUES ($1, $2, $3, $4)",
             )
             .bind(client_id.parse::<i32>().unwrap())
-            .bind(payload.valor)
-            .bind(payload.tipo)
-            .bind(payload.descricao)
-            .execute(&state)
+            .bind(&payload.valor)
+            .bind(&payload.tipo)
+            .bind(&payload.descricao)
+            .execute(&mut *trx)
             .await
-            .expect("error while insert transacoes");
+            .expect("Error while inserting transacoes");
+
+            trx.commit()
+                .await
+                .expect("Error while commiting transaction");
 
             (
-                StatusCode::CREATED,
-                Json(serde_json::to_value(cliente).unwrap()),
+                StatusCode::OK,
+                Json(json!({
+                    "limite": cliente.limite,
+                    "saldo": new_saldo
+                })),
             )
         }
         Err(_) => {
             println!("ERROR!");
             (
-                StatusCode::BAD_REQUEST,
+                StatusCode::from_u16(404).unwrap(),
                 Json(json!({
                     "message":"cliente inexistente"
                 })),
