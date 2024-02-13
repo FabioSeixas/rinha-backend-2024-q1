@@ -12,4 +12,5 @@ Ideas:
 1. I'am starting the transaction after checking if the user exists. I should include this first check in the transaction.
 2. Manage transactions from Postgres (use functions `debitar` and `creditar` from `init.sql`)
 3. Try different combinations of CPU and Memory for services (`docker-compose.yml`)
+4. Possible error in my logic?
 
