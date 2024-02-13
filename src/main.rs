@@ -9,9 +9,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{
-    postgres::{ PgPoolOptions, PgRow},
+    postgres::{PgPoolOptions, PgRow},
     Postgres, Row,
 };
+use std::env;
 
 use types::{CreateTransactionPayload, Transaction, TransactionType};
 
@@ -246,10 +247,17 @@ async fn transaction(
 
 #[tokio::main]
 async fn main() -> Result<(), sqlx::Error> {
+    println!("Start to set up server");
+
     let pool = PgPoolOptions::new()
         .max_connections(20)
-        .connect("postgres://admin:123@localhost/rinha")
+        .connect(format!(
+            "postgres://admin:123@{}/rinha",
+            env::var("DB_HOST").unwrap()
+        ).as_str())
         .await?;
+
+    println!("db pool started");
 
     let app = Router::new()
         .route("/clientes", get(get_clientes))
@@ -257,8 +265,15 @@ async fn main() -> Result<(), sqlx::Error> {
         .route("/clientes/:id/transacoes", post(transaction))
         .with_state(pool.clone());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    println!("will bind api entrypoint");
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .expect("Error while bindind port 3000");
+    // let listener = tokio::net::TcpListener::bind("localhost:9999").await.unwrap();
+    axum::serve(listener, app)
+        .await
+        .expect("Error while serving");
 
     Ok(())
 }
