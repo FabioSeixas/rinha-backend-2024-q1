@@ -94,6 +94,7 @@ async fn extrato(
                 "SELECT valor, tipo, descricao, realizada_em::TEXT
                  FROM transacoes
                  WHERE cliente_id = $1
+                 ORDER BY realizada_em desc
                  LIMIT 10",
             )
             .bind(parse_client_id(&cliente_id))
