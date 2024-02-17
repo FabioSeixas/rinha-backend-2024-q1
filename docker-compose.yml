@@ -1,5 +1,8 @@
 version: "3.9"
 
+x-common-variables: &common-variables
+  DB_HOST: db
+  POOL_MAX_CONNECTIONS: 10 
 
 services:
   db: 
@@ -17,31 +20,31 @@ services:
       resources:
         limits:
           cpus: "0.75"
-          memory: "250MB"
+          memory: "460MB"
 
   api01: 
     image: rinha-api-1
     depends_on:
       - db
     environment:
-      - DB_HOST=db
+      <<: *common-variables
     deploy:
       resources:
         limits:
           cpus: "0.25"
-          memory: "100MB"
+          memory: "30MB"
 
   api02: 
     image: rinha-api-1
     depends_on:
       - db
     environment:
-      - DB_HOST=db
+      <<: *common-variables
     deploy:
       resources:
         limits:
           cpus: "0.25"
-          memory: "100MB"
+          memory: "30MB"
 
   nginx:
     image: nginx:latest
@@ -56,7 +59,7 @@ services:
       resources:
         limits:
           cpus: "0.25"
-          memory: "100MB"
+          memory: "30MB"
 
 networks:
   default:

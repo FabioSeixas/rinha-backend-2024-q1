@@ -1,6 +1,6 @@
 use axum::{
     debug_handler,
-    extract::{Path, State},
+    extract::{rejection::JsonRejection, Path, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -53,14 +53,14 @@ fn parse_client_id(id: &str) -> i32 {
         .expect(format!("Fail to parse client id: {}", id).as_str())
 }
 
-async fn client_exist(
-    db: &sqlx::pool::Pool<Postgres>,
+async fn client_exist_trx(
+    trx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     client_id: &str,
 ) -> Result<Cliente, sqlx::Error> {
     sqlx::query("SELECT * from clientes WHERE id = $1")
         .bind(parse_client_id(client_id))
         .map(|row: PgRow| Cliente::new(row.get(0), row.get(1), row.get(2)))
-        .fetch_one(db)
+        .fetch_one(&mut **trx)
         .await
 }
 
@@ -83,9 +83,9 @@ async fn extrato(
     State(state): State<sqlx::pool::Pool<Postgres>>,
     Path(cliente_id): Path<String>,
 ) -> impl IntoResponse {
-    match client_exist(&state, &cliente_id).await {
+    let mut trx = state.begin().await.expect("Error while starting trx");
+    match client_exist_trx(&mut trx, &cliente_id).await {
         Ok(cliente) => {
-            let mut trx = state.begin().await.expect("Error while starting trx");
             let saldo_atual = get_current_saldo(&mut trx, &cliente_id)
                 .await
                 .expect("Error while getting current saldo");
@@ -137,32 +137,87 @@ async fn extrato(
 async fn transaction(
     State(state): State<sqlx::pool::Pool<Postgres>>,
     Path(client_id): Path<String>,
-    Json(payload): Json<CreateTransactionPayload>,
+    payload_raw: Result<Json<CreateTransactionPayload>, JsonRejection>,
 ) -> impl IntoResponse {
-    match client_exist(&state, &client_id).await {
-        Ok(cliente) => {
-            let mut trx = state.begin().await.expect("Error while starting transaction");
+    let payload = match payload_raw {
+        Ok(p) => p,
+        Err(err) => match err {
+            JsonRejection::JsonDataError(err) => {
+                return (
+                    StatusCode::from_u16(422).expect("Error while making StatusCode 422 from u16"),
+                    Json(json!({
+                        "message":"payload invalido"
+                    })),
+                );
+            }
+            err => {
+                let message = format!("{:?}", err);
+                return (
+                    StatusCode::from_u16(422).expect("Error while making StatusCode 422 from u16"),
+                    Json(json!({
+                        "title":"Erro no payload",
+                        "message": message
+                    })),
+                );
+            }
+        },
+    };
 
+    let mut trx = state
+        .begin()
+        .await
+        .expect("Error while starting transaction");
+    match client_exist_trx(&mut trx, &client_id).await {
+        Ok(cliente) => {
             let saldo_atual = get_current_saldo(&mut trx, &client_id)
                 .await
                 .expect("Error while getting current saldo");
 
-            // println!("saldo atual: {saldo_atual}");
+            if payload.descricao.len() == 0 {
+                return (
+                    StatusCode::from_u16(422).expect("Error while making StatusCode 422 from u16"),
+                    Json(json!({
+                        "message":"sem descricao"
+                    })),
+                );
+            }
+
+            println!("description exists");
+
+            if payload.descricao.len() > 10 {
+                return (
+                    StatusCode::from_u16(422).expect("Error while making StatusCode 422 from u16"),
+                    Json(json!({
+                        "message":"descricao maior do que 10 chars"
+                    })),
+                );
+            }
+
+            println!("description len < 10");
 
             let transaction_type = if payload.tipo == "d" {
                 TransactionType::Debit
-            } else {
+            } else if payload.tipo == "c" {
                 TransactionType::Credit
+            } else {
+                return (
+                    StatusCode::from_u16(422).expect("Error while making StatusCode 422 from u16"),
+                    Json(json!({
+                        "message":"tipo de transacao nao aceito."
+                    })),
+                );
             };
+
+            println!("transaction type ok");
 
             let new_saldo = match transaction_type {
                 types::TransactionType::Debit => {
                     let new_saldo = saldo_atual - payload.valor;
-                    // println!("new saldo: {new_saldo}");
                     if new_saldo < 0 {
                         if new_saldo.abs() > cliente.limite {
                             return (
-                                StatusCode::from_u16(422).expect("Error while making StatusCode 422 from u16"),
+                                StatusCode::from_u16(422)
+                                    .expect("Error while making StatusCode 422 from u16"),
                                 Json(json!({
                                     "message":"sem limite disponivel"
                                 })),
@@ -205,7 +260,7 @@ async fn transaction(
                  VALUES ($1, $2, $3, $4)",
             )
             .bind(cliente.id)
-            .bind(&payload.valor)
+            .bind(payload.valor)
             .bind(&payload.tipo)
             .bind(&payload.descricao)
             .execute(&mut *trx)
@@ -242,9 +297,13 @@ async fn transaction(
 async fn main() -> Result<(), sqlx::Error> {
     println!("Start to set up server");
     let db_host = env::var("DB_HOST").expect("Fail to get DB_HOST env");
+    let pool_max_con = env::var("POOL_MAX_CONNECTIONS")
+        .expect("Fail to get POOL_MAX_CONNECTIONS env")
+        .parse::<u32>()
+        .expect("Fail to parse POOL_MAX_CONNECTIONS env");
 
     let pool = PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(pool_max_con)
         .connect(format!("postgres://admin:123@{}/rinha", db_host).as_str())
         .await?;
 
